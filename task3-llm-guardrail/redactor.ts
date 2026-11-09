@@ -127,17 +127,25 @@ function redactCards(text: string, stats: RedactionStats): string {
 // ---------------------------------------------------------------------------
 // Whole-string redaction
 // ---------------------------------------------------------------------------
-/** Redacts a complete string. Order matters: emails may contain digits, cards may contain SSN-shaped groups. */
+/**
+ * Redacts a complete string. Order matters:
+ *  1. emails: they may contain digits that would otherwise feed the card scan
+ *  2. SSNs: a rigid 3-2-4 shape with digit lookarounds, so it is far less
+ *     ambiguous than a Luhn window. Removing SSNs first keeps "123-45-6789
+ *     4111 1111 1111 1111" from being read as one digit run in which a
+ *     cross-number window like "6789 4111 1111 1111" can pass Luhn by chance.
+ *  3. cards: the Luhn window search over whatever digit runs remain.
+ */
 export function redactText(text: string, stats: RedactionStats = { emails: 0, ssns: 0, cards: 0 }): string {
   let out = text.replace(EMAIL_RE, () => {
     stats.emails++;
     return REDACTED;
   });
-  out = redactCards(out, stats);
   out = out.replace(SSN_RE, () => {
     stats.ssns++;
     return REDACTED;
   });
+  out = redactCards(out, stats);
   return out;
 }
 

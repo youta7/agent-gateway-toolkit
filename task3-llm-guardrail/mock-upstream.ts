@@ -17,7 +17,7 @@ const MAX_LONG_WORDS = 50_000;
  * Canned tokens. Boundaries are chosen to be hostile:
  *  - the email is split across three tokens
  *  - the spaced card is split mid-group
- *  - the dashed card arrives whole (it must still be caught)
+ *  - the dashed card and a plain 15-digit Amex arrive whole (must still be caught)
  *  - two SSNs, one 13-digit order id that FAILS Luhn (must survive),
  *    a phone number and a ZIP (must survive)
  *  - the final token is an email with nothing after it, so the gateway's
@@ -43,6 +43,9 @@ export const CANNED_TOKENS: readonly string[] = [
   ",",
   " backup",
   " 5500-0000-0000-0004",
+  ",",
+  " amex",
+  " 378282246310005",
   ".",
   " SSN",
   " 123-45-6789",
