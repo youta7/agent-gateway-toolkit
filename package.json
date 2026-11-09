@@ -20,7 +20,8 @@
     "t4:providers": "tsx task4-router/mock-providers.ts",
     "t4:router": "tsx task4-router/gateway.ts",
     "t4:test": "tsx task4-router/test.ts",
-    "check-env": "tsx scripts/check-env.ts"
+    "check-env": "tsx scripts/check-env.ts",
+    "test:all": "tsx scripts/run-all.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
