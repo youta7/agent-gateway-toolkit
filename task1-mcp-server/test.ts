@@ -1,14 +1,19 @@
 // End-to-end test: spawns server.ts over stdio via the SDK client and checks
-// that protocol errors and domain failures arrive on the right channel.
+// that protocol errors and domain failures arrive on the right channel. Also
+// covers stdout hardening (lockStdout) and raw-wire malformed input.
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { ErrorCode, McpError, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { lockStdout, looksLikeJsonRpcFrame } from "./logger.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const serverPath = join(here, "server.ts");
+const tsxCli = join(here, "..", "node_modules", "tsx", "dist", "cli.mjs");
 
 interface Check {
   name: string;
@@ -46,6 +51,169 @@ function issuesOf(err: McpError): Array<{ path: unknown[]; code: string }> {
   assert.ok(data?.issues && data.issues.length > 0, "expected Zod issues in error.data.issues");
   return data.issues;
 }
+
+// ---------------------------------------------------------------------------
+// Stdout hardening: in-process unit checks on lockStdout().
+// ---------------------------------------------------------------------------
+async function checkLockStdout(): Promise<void> {
+  const stdoutWrites: string[] = [];
+  const stderrWrites: string[] = [];
+  const realStdout = process.stdout.write;
+  const realStderr = process.stderr.write;
+
+  // Spy on both streams, then lock. lockStdout captures the spy as "original",
+  // so anything that passes the guard lands in stdoutWrites.
+  process.stdout.write = ((chunk: unknown) => {
+    stdoutWrites.push(String(chunk));
+    return true;
+  }) as typeof process.stdout.write;
+  process.stderr.write = ((chunk: unknown) => {
+    stderrWrites.push(String(chunk));
+    return true;
+  }) as typeof process.stderr.write;
+
+  const unlock = lockStdout();
+  try {
+    console.log("hello from console.log");
+    console.info("info line");
+    console.debug("debug line");
+    console.warn("warn line");
+    process.stdout.write("stray banner\n");
+    process.stdout.write(Buffer.from("buffer junk\n"));
+    let cbCalled = false;
+    process.stdout.write("junk with cb\n", () => {
+      cbCalled = true;
+    });
+    const frame = '{"jsonrpc":"2.0","id":1,"result":{}}\n';
+    const notification = '  {"jsonrpc":"2.0","method":"notifications/x"}\n';
+    process.stdout.write(frame);
+    process.stdout.write(notification);
+    await new Promise((r) => setImmediate(r));
+
+    assert.deepEqual(stdoutWrites, [frame, notification], "only frames reach stdout");
+    assert.ok(cbCalled, "diverted write still invokes its callback");
+    const stderrText = stderrWrites.join("");
+    const needles = ["hello from console.log", "info line", "debug line", "warn line", "stray banner", "buffer junk", "junk with cb"];
+    for (const needle of needles) {
+      assert.ok(stderrText.includes(needle), `stderr should contain ${JSON.stringify(needle)}`);
+    }
+    const warnings = stderrWrites.filter((w) => w.includes('"event":"stdout_diverted"'));
+    assert.equal(warnings.length, 3, "one structured warning per diverted write");
+
+    assert.equal(looksLikeJsonRpcFrame('{"jsonrpc":"2.0"}'), true);
+    assert.equal(looksLikeJsonRpcFrame('\n {"jsonrpc": "2.0"}'), true);
+    assert.equal(looksLikeJsonRpcFrame('{"foo":1}'), false);
+    assert.equal(looksLikeJsonRpcFrame('jsonrpc {"x":1}'), false);
+  } finally {
+    unlock();
+    process.stdout.write = realStdout;
+    process.stderr.write = realStderr;
+  }
+  assert.equal(process.stdout.write, realStdout, "unlock restores stdout.write");
+}
+
+// ---------------------------------------------------------------------------
+// Raw wire: feed malformed lines straight into the server's stdin and inspect
+// every byte it emits on stdout. The SDK client cannot send these, so we use a
+// bare child process.
+// ---------------------------------------------------------------------------
+interface RawFrame {
+  id?: unknown;
+  result?: unknown;
+  error?: { code: number; message: string; data?: unknown };
+}
+
+async function checkRawWire(): Promise<void> {
+  const child = spawn(process.execPath, [tsxCli, serverPath], { stdio: ["pipe", "pipe", "pipe"] });
+  const stderr: string[] = [];
+  child.stderr.on("data", (c: Buffer) => stderr.push(c.toString()));
+
+  const lines: string[] = [];
+  let pending = "";
+  child.stdout.on("data", (c: Buffer) => {
+    pending += c.toString();
+    let nl: number;
+    while ((nl = pending.indexOf("\n")) !== -1) {
+      lines.push(pending.slice(0, nl));
+      pending = pending.slice(nl + 1);
+    }
+  });
+
+  const gotId = (id: number): Promise<void> =>
+    new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`timed out waiting for id ${id}`)), 15_000);
+      const check = () => {
+        const seen = lines.some((l) => {
+          try {
+            return (JSON.parse(l) as RawFrame).id === id;
+          } catch {
+            return false;
+          }
+        });
+        if (seen) {
+          clearTimeout(timer);
+          child.stdout.off("data", check);
+          resolve();
+        }
+      };
+      child.stdout.on("data", check);
+      check();
+    });
+
+  const send = (line: string) => child.stdin.write(line + "\n");
+  try {
+    send(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "raw", version: "0" } },
+      }),
+    );
+    await gotId(1);
+    send(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }));
+
+    send("this is not json at all");
+    send("{not even close");
+    send(JSON.stringify({ foo: "bar" })); // valid JSON, invalid envelope
+    send(JSON.stringify({ jsonrpc: "1.0", id: 5, method: "tools/list" })); // wrong version
+    send(JSON.stringify({ jsonrpc: "2.0", id: 9, method: "tools/list" })); // still alive?
+    await gotId(9);
+
+    const frames = lines.map((l) => JSON.parse(l) as RawFrame);
+    const parseErrors = frames.filter((f) => f.error?.code === -32700);
+    const invalidRequests = frames.filter((f) => f.error?.code === -32600);
+    assert.equal(parseErrors.length, 2, `expected two -32700 frames, got ${JSON.stringify(frames)}`);
+    assert.equal(invalidRequests.length, 2, `expected two -32600 frames, got ${JSON.stringify(frames)}`);
+    for (const f of [...parseErrors, ...invalidRequests]) {
+      assert.ok("id" in f && f.id === null, `malformed-frame response must carry id null: ${JSON.stringify(f)}`);
+    }
+    assert.equal(parseErrors[0]?.error?.message, "Parse error");
+    assert.equal(invalidRequests[0]?.error?.message, "Invalid Request");
+    const data = invalidRequests[0]?.error?.data as { issues?: unknown } | undefined;
+    assert.ok(Array.isArray(data?.issues), "envelope issues attached to -32600 data");
+
+    const alive = frames.find((f) => f.id === 9);
+    assert.ok(alive?.result, "server keeps serving after malformed input");
+
+    // Every single stdout line must be a JSON-RPC frame: nothing else leaked.
+    for (const l of lines) {
+      assert.ok(looksLikeJsonRpcFrame(l), `non-frame on stdout: ${l}`);
+    }
+    assert.equal(pending, "", "no partial trailing garbage on stdout");
+
+    assert.ok(stderr.join("").includes('"event":"malformed_frame"'), "server logged malformed frames to stderr");
+  } finally {
+    child.stdin.end();
+    child.kill();
+    await once(child, "exit").catch(() => undefined);
+  }
+}
+
+const standalone: Check[] = [
+  { name: "lockStdout diverts non-frames to stderr and passes frames", run: () => checkLockStdout() },
+  { name: "raw wire: bad JSON -> -32700, bad envelope -> -32600, server survives", run: () => checkRawWire() },
+];
 
 const checks: Check[] = [
   {
@@ -204,10 +372,22 @@ const checks: Check[] = [
   },
 ];
 
+async function runCheck(check: Check, client: Client): Promise<boolean> {
+  try {
+    await check.run(client);
+    console.log(`PASS  ${check.name}`);
+    return true;
+  } catch (err) {
+    console.log(`FAIL  ${check.name}`);
+    console.log(`      ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
+}
+
 async function main(): Promise<void> {
   const transport = new StdioClientTransport({
     command: process.execPath,
-    args: [join(here, "..", "node_modules", "tsx", "dist", "cli.mjs"), serverPath],
+    args: [tsxCli, serverPath],
     stderr: "pipe",
   });
   const client = new Client({ name: "task1-test", version: "0.1.0" });
@@ -218,15 +398,8 @@ async function main(): Promise<void> {
   await client.connect(transport);
 
   let failed = 0;
-  for (const check of checks) {
-    try {
-      await check.run(client);
-      console.log(`PASS  ${check.name}`);
-    } catch (err) {
-      failed++;
-      console.log(`FAIL  ${check.name}`);
-      console.log(`      ${err instanceof Error ? err.message : String(err)}`);
-    }
+  for (const check of [...standalone, ...checks]) {
+    if (!(await runCheck(check, client))) failed++;
   }
 
   await client.close();
@@ -236,7 +409,8 @@ async function main(): Promise<void> {
     console.log(serverLogs.join(""));
   }
 
-  console.log(`\n${checks.length - failed}/${checks.length} passed`);
+  const total = standalone.length + checks.length;
+  console.log(`\n${total - failed}/${total} passed`);
   process.exit(failed === 0 ? 0 : 1);
 }
 

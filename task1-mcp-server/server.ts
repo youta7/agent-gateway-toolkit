@@ -7,10 +7,16 @@ import {
   ListToolsRequestSchema,
   McpError,
   type CallToolResult,
+  type JSONRPCMessage,
 } from "@modelcontextprotocol/sdk/types.js";
 import type { z } from "zod";
 import { customers, fromCents, toCents } from "./customers.js";
-import { log } from "./logger.js";
+import { lockStdout, log } from "./logger.js";
+
+// First thing in the module body: nothing may touch stdout except the
+// transport. (Imports above run before this, but none of them write to
+// stdout at load time.)
+lockStdout();
 import {
   GetCustomerRecordInput,
   TOOL_DEFINITIONS,
@@ -155,8 +161,65 @@ function triggerRefund(args: TriggerRefundArgs): CallToolResult {
   });
 }
 
+/**
+ * Turns transport-level read failures into JSON-RPC error responses.
+ *
+ * The SDK's StdioServerTransport parses each stdin line with
+ * JSON.parse + JSONRPCMessageSchema. On failure it calls onerror and moves on,
+ * so by default the client never hears back. Per JSON-RPC 2.0:
+ *   - unparseable JSON          -> -32700 Parse error,    id null
+ *   - JSON but not a valid frame -> -32600 Invalid Request, id null
+ * The id is null in both cases because the transport hands us only the
+ * thrown error, not the raw line, so the request id cannot be recovered.
+ *
+ * This must be attached BEFORE server.connect(): connect() wraps whatever
+ * onerror is already on the transport and chains to it, so a handler set
+ * afterwards would replace the SDK's own wiring instead.
+ */
+function installTransportErrorResponder(transport: StdioServerTransport): void {
+  transport.onerror = (err: Error) => {
+    const response = classifyTransportError(err);
+    if (!response) {
+      log("error", "transport_error", { message: err.message });
+      return;
+    }
+    log("warn", "malformed_frame", { code: response.error.code, message: err.message });
+    // The SDK's JSONRPCMessage type does not admit id: null, but the spec
+    // requires it here and send() serializes without validating.
+    transport.send(response as unknown as JSONRPCMessage).catch((sendErr: unknown) => {
+      log("error", "error_response_failed", {
+        message: sendErr instanceof Error ? sendErr.message : String(sendErr),
+      });
+    });
+  };
+}
+
+interface JsonRpcErrorResponse {
+  jsonrpc: "2.0";
+  id: null;
+  error: { code: number; message: string; data?: unknown };
+}
+
+function classifyTransportError(err: Error): JsonRpcErrorResponse | null {
+  if (err instanceof SyntaxError) {
+    return { jsonrpc: "2.0", id: null, error: { code: ErrorCode.ParseError, message: "Parse error" } };
+  }
+  // ZodError from the SDK's bundled zod/v4; duck-typed so we do not depend on
+  // which zod instance the SDK resolved.
+  const issues = (err as { issues?: unknown }).issues;
+  if (err.name === "ZodError" || Array.isArray(issues)) {
+    return {
+      jsonrpc: "2.0",
+      id: null,
+      error: { code: ErrorCode.InvalidRequest, message: "Invalid Request", data: { issues } },
+    };
+  }
+  return null;
+}
+
 async function main(): Promise<void> {
   const transport = new StdioServerTransport();
+  installTransportErrorResponder(transport);
   server.onerror = (err) => log("error", "server_error", { message: err.message });
   await server.connect(transport);
   log("info", "server_started", { transport: "stdio", tools: TOOL_DEFINITIONS.map((t) => t.name) });
