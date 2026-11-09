@@ -1,0 +1,35 @@
+{
+  "name": "agent-gateway-toolkit",
+  "version": "0.1.0",
+  "private": true,
+  "description": "MCP server, MCP gateway, LLM guardrail, and router tasks built on Node 22.5+ (node:sqlite, fetch) with no build step",
+  "type": "module",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "t1:server": "tsx task1-mcp-server/server.ts",
+    "t1:test": "tsx task1-mcp-server/test.ts",
+    "t2:downstream": "tsx task2-mcp-gateway/downstream.ts",
+    "t2:gateway": "tsx task2-mcp-gateway/gateway.ts",
+    "t2:test": "tsx task2-mcp-gateway/test.ts",
+    "t3:upstream": "tsx task3-llm-guardrail/upstream.ts",
+    "t3:gateway": "tsx task3-llm-guardrail/gateway.ts",
+    "t3:test": "tsx task3-llm-guardrail/test.ts",
+    "t4:providers": "tsx task4-router/providers.ts",
+    "t4:router": "tsx task4-router/router.ts",
+    "t4:test": "tsx task4-router/test.ts",
+    "check-env": "tsx scripts/check-env.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.23.0",
+    "zod-to-json-schema": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.5.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
