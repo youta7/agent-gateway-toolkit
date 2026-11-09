@@ -48,12 +48,17 @@ export function billPromptTokens(messages: unknown): number {
   return n;
 }
 
-const FAKE_STACK = [
-  "com.example.inference.ModelPoolExhaustedException: no healthy replicas for model gpt-mock",
-  "\tat com.example.inference.Scheduler.acquire(Scheduler.java:214)",
+/** Internal hostname that must never reach a client. */
+export const FAKE_INTERNAL_HOST = "inference-primary-03.internal.corp.example";
+
+/** Body of the 500 response: the kind of thing a real provider leaks. */
+export const FAKE_STACK = [
+  "java.lang.NullPointerException: ModelShard[3] is null for model gpt-mock",
+  "\tat com.example.inference.ModelShard.acquire(ModelShard.java:214)",
+  "\tat com.example.inference.Scheduler.acquire(Scheduler.java:97)",
   "\tat com.example.inference.CompletionHandler.handle(CompletionHandler.java:88)",
   "\tat io.netty.channel.AbstractChannelHandlerContext.invokeChannelRead(AbstractChannelHandlerContext.java:379)",
-  "host: inference-primary-03.internal.corp.example",
+  `host: ${FAKE_INTERNAL_HOST}`,
 ].join("\n");
 
 function sendJson(res: ServerResponse, status: number, payload: unknown, headers: Record<string, string> = {}): void {
